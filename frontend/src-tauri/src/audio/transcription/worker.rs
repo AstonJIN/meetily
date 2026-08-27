@@ -4,6 +4,7 @@
 
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
+use super::zipformer_provider::StreamingAsrEngine;
 use crate::audio::AudioChunk;
 use crate::audio::{AudioPipelineMetrics, AudioQueueReceiver, PipelineQueue};
 use log::{error, info, warn};
@@ -83,6 +84,7 @@ pub fn start_transcription_task<R: Runtime>(
             let engine_clone = match &transcription_engine {
                 TranscriptionEngine::Whisper(e) => TranscriptionEngine::Whisper(e.clone()),
                 TranscriptionEngine::Parakeet(e) => TranscriptionEngine::Parakeet(e.clone()),
+                TranscriptionEngine::Zipformer(e) => TranscriptionEngine::Zipformer(e.clone()),
                 TranscriptionEngine::Provider(p) => TranscriptionEngine::Provider(p.clone()),
             };
             let app_clone = app.clone();
@@ -153,10 +155,13 @@ pub fn start_transcription_task<R: Runtime>(
                             )
                             .await
                             {
-                                Ok((transcript, confidence_opt, is_partial)) => {
+                                Ok(results) => {
+                                    for (transcript, confidence_opt, is_partial) in results {
                                     // Provider-aware confidence threshold
                                     let confidence_threshold = match &engine_clone {
-                                        TranscriptionEngine::Whisper(_) | TranscriptionEngine::Provider(_) => 0.3,
+                                        TranscriptionEngine::Whisper(_)
+                                        | TranscriptionEngine::Zipformer(_)
+                                        | TranscriptionEngine::Provider(_) => 0.3,
                                         TranscriptionEngine::Parakeet(_) => 0.0, // Parakeet has no confidence, accept all
                                     };
 
@@ -235,6 +240,7 @@ pub fn start_transcription_task<R: Runtime>(
                                         if let Some(c) = confidence_opt {
                                             info!("Worker {} low-confidence transcription (confidence: {:.2}), skipping", worker_id, c);
                                         }
+                                    }
                                     }
                                 }
                                 Err(e) => {
@@ -402,17 +408,58 @@ pub fn start_transcription_task<R: Runtime>(
             }
         }
 
+        // VAD emits speech ranges without their trailing silence. Give the
+        // streaming provider an explicit end-of-input signal so its final
+        // hypothesis is not stranded when the recording stops.
+        if let TranscriptionEngine::Zipformer(provider) = &transcription_engine {
+            match provider.drain() {
+                Ok(results) => {
+                    for result in results {
+                        let transcript = result.text.trim().to_string();
+                        if transcript.is_empty() {
+                            continue;
+                        }
+
+                        let sequence_id = SEQUENCE_COUNTER.fetch_add(1, Ordering::SeqCst);
+                        let audio_start_time = result.start_time.unwrap_or(0.0).max(0.0);
+                        let update = TranscriptUpdate {
+                            text: transcript,
+                            timestamp: format_current_timestamp(),
+                            source: "Audio".to_string(),
+                            sequence_id,
+                            chunk_start_time: audio_start_time,
+                            is_partial: false,
+                            confidence: 0.85,
+                            audio_start_time,
+                            audio_end_time: audio_start_time,
+                            duration: 0.0,
+                        };
+
+                        if let Err(error) = app.emit("transcript-update", &update) {
+                            warn!("Failed to emit Zipformer final transcript update: {}", error);
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!("Zipformer drain failed during recording shutdown: {}", error);
+                }
+            }
+            provider.unload();
+        }
+
         info!("✅ Parallel transcription task completed - all workers finished, ready for model unload");
     })
 }
 
 /// Transcribe audio chunk using the appropriate provider (Whisper, Parakeet, or trait-based)
-/// Returns: (text, confidence Option, is_partial)
+/// Returns zero or more `(text, confidence Option, is_partial)` updates.
+/// Streaming providers may emit a partial and a final update for one input
+/// chunk; batch providers continue to return at most one update.
 async fn transcribe_chunk_with_provider<R: Runtime>(
     engine: &TranscriptionEngine,
     chunk: AudioChunk,
     app: &AppHandle<R>,
-) -> std::result::Result<(String, Option<f32>, bool), TranscriptionError> {
+) -> std::result::Result<Vec<(String, Option<f32>, bool)>, TranscriptionError> {
     // Convert to 16kHz mono for transcription
     let transcription_data = if chunk.sample_rate != 16000 {
         crate::audio::audio_processing::resample_audio(&chunk.data, chunk.sample_rate, 16000)
@@ -458,7 +505,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                 Ok((text, confidence, is_partial)) => {
                     let cleaned_text = text.trim().to_string();
                     if cleaned_text.is_empty() {
-                        return Ok((String::new(), Some(confidence), is_partial));
+                        return Ok(vec![(String::new(), Some(confidence), is_partial)]);
                     }
 
                     info!(
@@ -466,7 +513,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         chunk.chunk_id, cleaned_text, confidence, is_partial
                     );
 
-                    Ok((cleaned_text, Some(confidence), is_partial))
+                    Ok(vec![(cleaned_text, Some(confidence), is_partial)])
                 }
                 Err(e) => {
                     error!(
@@ -493,7 +540,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                 Ok(text) => {
                     let cleaned_text = text.trim().to_string();
                     if cleaned_text.is_empty() {
-                        return Ok((String::new(), None, false));
+                        return Ok(vec![(String::new(), None, false)]);
                     }
 
                     info!(
@@ -502,7 +549,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                     );
 
                     // Parakeet doesn't provide confidence or partial results
-                    Ok((cleaned_text, None, false))
+                    Ok(vec![(cleaned_text, None, false)])
                 }
                 Err(e) => {
                     error!(
@@ -525,14 +572,14 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
             }
         }
         TranscriptionEngine::Provider(provider) => {
-            // NEW: Trait-based provider (clean, unified interface)
+            // Trait-based provider (clean, unified interface)
             let language = crate::get_language_preference_internal();
 
             match provider.transcribe(speech_samples, language).await {
                 Ok(result) => {
                     let cleaned_text = result.text.trim().to_string();
                     if cleaned_text.is_empty() {
-                        return Ok((String::new(), result.confidence, result.is_partial));
+                        return Ok(vec![(String::new(), result.confidence, result.is_partial)]);
                     }
 
                     let confidence_str = match result.confidence {
@@ -549,7 +596,7 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         result.is_partial
                     );
 
-                    Ok((cleaned_text, result.confidence, result.is_partial))
+                    Ok(vec![(cleaned_text, result.confidence, result.is_partial)])
                 }
                 Err(e) => {
                     error!(
@@ -557,6 +604,31 @@ async fn transcribe_chunk_with_provider<R: Runtime>(
                         provider.provider_name(),
                         chunk.chunk_id,
                         e
+                    );
+
+                    let _ = app.emit(
+                        "transcription-error",
+                        &serde_json::json!({
+                            "error": e.to_string(),
+                            "userMessage": format!("Transcription failed: {}", e),
+                            "actionable": false
+                        }),
+                    );
+
+                    Err(e)
+                }
+            }
+        }
+        TranscriptionEngine::Zipformer(provider) => {
+            match provider.accept_audio(16000, &speech_samples) {
+                Ok(results) => Ok(results
+                    .into_iter()
+                    .map(|result| (result.text.trim().to_string(), None, !result.is_final))
+                    .collect()),
+                Err(e) => {
+                    error!(
+                        "Zipformer transcription failed for chunk {}: {}",
+                        chunk.chunk_id, e
                     );
 
                     let _ = app.emit(

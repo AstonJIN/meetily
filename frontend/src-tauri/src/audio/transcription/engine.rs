@@ -3,6 +3,7 @@
 // TranscriptionEngine enum and model initialization/validation logic.
 
 use super::provider::TranscriptionProvider;
+use super::zipformer_provider::{pilot_enabled, StreamingAsrEngine, ZipformerProvider};
 use log::{info, warn};
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime};
@@ -15,6 +16,7 @@ use tauri::{AppHandle, Manager, Runtime};
 pub enum TranscriptionEngine {
     Whisper(Arc<crate::whisper_engine::WhisperEngine>),  // Direct access (backward compat)
     Parakeet(Arc<crate::parakeet_engine::ParakeetEngine>), // Direct access (backward compat)
+    Zipformer(Arc<ZipformerProvider>), // Explicit phase-2 development pilot
     Provider(Arc<dyn TranscriptionProvider>),  // Trait-based (preferred for new code)
 }
 
@@ -24,6 +26,7 @@ impl TranscriptionEngine {
         match self {
             Self::Whisper(engine) => engine.is_model_loaded().await,
             Self::Parakeet(engine) => engine.is_model_loaded().await,
+            Self::Zipformer(engine) => engine.is_loaded(),
             Self::Provider(provider) => provider.is_model_loaded().await,
         }
     }
@@ -33,6 +36,7 @@ impl TranscriptionEngine {
         match self {
             Self::Whisper(engine) => engine.get_current_model().await,
             Self::Parakeet(engine) => engine.get_current_model().await,
+            Self::Zipformer(engine) => Some(engine.model_root().display().to_string()),
             Self::Provider(provider) => provider.get_current_model().await,
         }
     }
@@ -42,6 +46,7 @@ impl TranscriptionEngine {
         match self {
             Self::Whisper(_) => "Whisper (direct)",
             Self::Parakeet(_) => "Parakeet (direct)",
+            Self::Zipformer(_) => "Zipformer (sherpa-onnx)",
             Self::Provider(provider) => provider.provider_name(),
         }
     }
@@ -85,6 +90,30 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
             }
         }
     };
+
+    // The pilot preflight intentionally happens before Whisper/Parakeet
+    // validation. This prevents loading a second heavy ASR model when the
+    // Zipformer runtime is available, while an initialization failure falls
+    // through to the configured legacy provider below.
+    if pilot_enabled() {
+        unload_legacy_asr_models().await;
+        match ZipformerProvider::from_environment() {
+            Ok(provider) => {
+                info!(
+                    "✅ Zipformer pilot preflight passed: {}",
+                    provider.model_root().display()
+                );
+                provider.unload();
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(
+                    "⚠️ Zipformer pilot preflight failed; validating configured fallback: {}",
+                    error
+                );
+            }
+        }
+    }
 
     // Validate based on provider
     match config.provider.as_str() {
@@ -145,6 +174,34 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
     }
 }
 
+async fn unload_legacy_asr_models() {
+    let parakeet = {
+        let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE
+            .lock()
+            .unwrap();
+        guard.as_ref().cloned()
+    };
+    if let Some(engine) = parakeet {
+        if engine.is_model_loaded().await {
+            info!("🧹 Unloading Parakeet before Zipformer pilot preflight");
+            let _ = engine.unload_model().await;
+        }
+    }
+
+    let whisper = {
+        let guard = crate::whisper_engine::commands::WHISPER_ENGINE
+            .lock()
+            .unwrap();
+        guard.as_ref().cloned()
+    };
+    if let Some(engine) = whisper {
+        if engine.is_model_loaded().await {
+            info!("🧹 Unloading Whisper before Zipformer pilot preflight");
+            let _ = engine.unload_model().await;
+        }
+    }
+}
+
 /// Get or initialize the appropriate transcription engine based on provider configuration
 pub async fn get_or_init_transcription_engine<R: Runtime>(
     app: &AppHandle<R>,
@@ -181,6 +238,28 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
             }
         }
     };
+
+    // Zipformer is a development-only override. If it cannot be initialized,
+    // continue through the existing provider selection below so Whisper and
+    // Parakeet remain the operational fallback paths.
+    if pilot_enabled() {
+        match ZipformerProvider::from_environment() {
+            Ok(provider) => {
+                info!(
+                    "🧪 Zipformer pilot enabled from {} using model directory {}",
+                    super::zipformer_provider::ZIPFORMER_PILOT_ENV,
+                    provider.model_root().display()
+                );
+                return Ok(TranscriptionEngine::Zipformer(Arc::new(provider)));
+            }
+            Err(error) => {
+                warn!(
+                    "⚠️ Zipformer pilot initialization failed; preserving configured fallback: {}",
+                    error
+                );
+            }
+        }
+    }
 
     // Initialize the appropriate engine based on provider
     match config.provider.as_str() {
