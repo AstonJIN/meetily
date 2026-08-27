@@ -7,6 +7,7 @@ use super::devices::AudioDevice;
 use super::buffer_pool::AudioBufferPool;
 use super::pipeline_metrics::{AudioPipelineMetrics, PipelineQueue};
 use super::bounded_queue::{AudioQueueSendError, AudioQueueSender};
+use super::session_clock::SessionClock;
 
 /// Device type for audio chunks
 #[derive(Debug, Clone, PartialEq)]
@@ -21,8 +22,46 @@ pub struct AudioChunk {
     pub data: Vec<f32>,
     pub sample_rate: u32,
     pub timestamp: f64,
+    pub pts_ns: u64,
     pub chunk_id: u64,
     pub device_type: DeviceType,
+}
+
+impl AudioChunk {
+    pub fn new(
+        data: Vec<f32>,
+        sample_rate: u32,
+        timestamp: f64,
+        chunk_id: u64,
+        device_type: DeviceType,
+    ) -> Self {
+        Self::with_pts_ns(data, sample_rate, timestamp, seconds_to_pts_ns(timestamp), chunk_id, device_type)
+    }
+
+    pub fn with_pts_ns(
+        data: Vec<f32>,
+        sample_rate: u32,
+        timestamp: f64,
+        pts_ns: u64,
+        chunk_id: u64,
+        device_type: DeviceType,
+    ) -> Self {
+        Self {
+            data,
+            sample_rate,
+            timestamp,
+            pts_ns,
+            chunk_id,
+            device_type,
+        }
+    }
+}
+
+fn seconds_to_pts_ns(seconds: f64) -> u64 {
+    if !seconds.is_finite() || seconds <= 0.0 {
+        return 0;
+    }
+    (seconds * 1_000_000_000.0).round().min(u64::MAX as f64) as u64
 }
 
 /// Processed audio chunk (post-VAD) for recording
@@ -108,6 +147,7 @@ pub struct RecordingState {
     // Audio pipeline
     audio_sender: Mutex<Option<AudioQueueSender<AudioChunk>>>,
     pipeline_metrics: Arc<AudioPipelineMetrics>,
+    session_clock: SessionClock,
 
     // Memory optimization
     buffer_pool: AudioBufferPool,
@@ -139,6 +179,7 @@ impl RecordingState {
             disconnected_device: Mutex::new(None),
             audio_sender: Mutex::new(None),
             pipeline_metrics: AudioPipelineMetrics::new(),
+            session_clock: SessionClock::new(),
             buffer_pool: AudioBufferPool::new(16, 48000), // Pool of 16 buffers with 48kHz samples capacity
             error_count: AtomicU32::new(0),
             recoverable_error_count: AtomicU32::new(0),
@@ -154,6 +195,7 @@ impl RecordingState {
     // Recording control
     pub fn start_recording(&self) -> Result<()> {
         self.pipeline_metrics.start_session();
+        self.session_clock.start();
         self.is_recording.store(true, Ordering::SeqCst);
         *self.recording_start.lock().unwrap() = Some(Instant::now());
         self.error_count.store(0, Ordering::SeqCst);
@@ -163,6 +205,7 @@ impl RecordingState {
     }
 
     pub fn stop_recording(&self) {
+        self.session_clock.stop();
         self.is_recording.store(false, Ordering::SeqCst);
         self.is_paused.store(false, Ordering::SeqCst);
         // Clear pause tracking when stopping
@@ -187,6 +230,7 @@ impl RecordingState {
         }
 
         self.is_paused.store(true, Ordering::SeqCst);
+        self.session_clock.pause();
         *self.pause_start.lock().unwrap() = Some(Instant::now());
         log::info!("Recording paused");
         Ok(())
@@ -208,6 +252,7 @@ impl RecordingState {
         }
 
         self.is_paused.store(false, Ordering::SeqCst);
+        self.session_clock.resume();
         Ok(())
     }
 
@@ -298,6 +343,10 @@ impl RecordingState {
 
     pub fn pipeline_metrics(&self) -> Arc<AudioPipelineMetrics> {
         self.pipeline_metrics.clone()
+    }
+
+    pub fn session_pts_ns(&self) -> u64 {
+        self.session_clock.pts_ns()
     }
 
     // Error handling
@@ -424,6 +473,7 @@ impl RecordingState {
         *self.recording_start.lock().unwrap() = None;
         *self.pause_start.lock().unwrap() = None;
         *self.total_pause_duration.lock().unwrap() = std::time::Duration::ZERO;
+        self.session_clock.reset();
         self.error_count.store(0, Ordering::SeqCst);
         self.recoverable_error_count.store(0, Ordering::SeqCst);
 
@@ -443,6 +493,7 @@ impl Default for RecordingState {
             disconnected_device: Mutex::new(None),
             audio_sender: Mutex::new(None),
             pipeline_metrics: AudioPipelineMetrics::new(),
+            session_clock: SessionClock::new(),
             buffer_pool: AudioBufferPool::new(16, 48000), // Pool of 16 buffers with 48kHz samples capacity
             error_count: AtomicU32::new(0),
             recoverable_error_count: AtomicU32::new(0),
@@ -464,5 +515,51 @@ impl Clone for RecordingStats {
             total_duration: self.total_duration,
             last_activity: self.last_activity,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_chunk_constructor_derives_nanosecond_pts() {
+        let chunk = AudioChunk::new(
+            vec![0.0; 2],
+            48_000,
+            1.25,
+            7,
+            DeviceType::Microphone,
+        );
+
+        assert_eq!(chunk.pts_ns, 1_250_000_000);
+        assert_eq!(chunk.timestamp, 1.25);
+    }
+
+    #[test]
+    fn invalid_audio_timestamp_maps_to_zero_pts() {
+        let chunk = AudioChunk::new(
+            Vec::new(),
+            48_000,
+            f64::NAN,
+            1,
+            DeviceType::System,
+        );
+
+        assert_eq!(chunk.pts_ns, 0);
+    }
+
+    #[test]
+    fn explicit_pts_is_preserved_for_derived_chunks() {
+        let chunk = AudioChunk::with_pts_ns(
+            Vec::new(),
+            16_000,
+            2.0,
+            1_999_999_999,
+            2,
+            DeviceType::Microphone,
+        );
+
+        assert_eq!(chunk.pts_ns, 1_999_999_999);
     }
 }

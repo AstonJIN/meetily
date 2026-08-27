@@ -606,16 +606,18 @@ impl AudioCapture {
 
         // Use global recording timestamp for proper synchronization
         let timestamp = self.state.get_recording_duration().unwrap_or(0.0);
+        let pts_ns = self.state.session_pts_ns();
 
         // RAW AUDIO CHUNK: No gain applied - will be mixed and gained downstream
         // Use 48kHz if we resampled, otherwise use original rate
-        let audio_chunk = AudioChunk {
-            data: mono_data,  // Raw audio (resampled if needed), no gain yet
-            sample_rate: if self.needs_resampling { 48000 } else { self.sample_rate },
+        let audio_chunk = AudioChunk::with_pts_ns(
+            mono_data,  // Raw audio (resampled if needed), no gain yet
+            if self.needs_resampling { 48000 } else { self.sample_rate },
             timestamp,
+            pts_ns,
             chunk_id,
-            device_type: self.device_type.clone(),
-        };
+            self.device_type.clone(),
+        );
 
         // NOTE: Raw audio is NOT sent to recording saver to prevent echo
         // Only the mixed audio (from AudioPipeline) is saved to file (see pipeline.rs:726-736)
@@ -850,13 +852,13 @@ impl AudioPipeline {
                                             info!("📤 Sending VAD segment: {:.1}ms, {} samples",
                                                   duration_ms, segment.samples.len());
 
-                                            let transcription_chunk = AudioChunk {
-                                                data: segment.samples,
-                                                sample_rate: 16000,
-                                                timestamp: segment.start_timestamp_ms / 1000.0,
-                                                chunk_id: self.chunk_id_counter,
-                                                device_type: DeviceType::Microphone,  // Mixed audio
-                                            };
+                                            let transcription_chunk = AudioChunk::new(
+                                                segment.samples,
+                                                16000,
+                                                segment.start_timestamp_ms / 1000.0,
+                                                self.chunk_id_counter,
+                                                DeviceType::Microphone,  // Mixed audio
+                                            );
 
                                             if let Err(e) = self.transcription_sender.send(transcription_chunk) {
                                                 self.metrics.send_failure(PipelineQueue::Transcription);
@@ -878,13 +880,14 @@ impl AudioPipeline {
 
                             // STEP 4: Send mixed audio for recording (WAV file)
                             if let Some(ref sender) = self.recording_sender_for_mixed {
-                                let recording_chunk = AudioChunk {
-                                    data: mixed_with_gain.clone(),
-                                    sample_rate: self.sample_rate,
-                                    timestamp: chunk.timestamp,
-                                    chunk_id: self.chunk_id_counter,
-                                    device_type: DeviceType::Microphone,  // Mixed audio
-                                };
+                                let recording_chunk = AudioChunk::with_pts_ns(
+                                    mixed_with_gain.clone(),
+                                    self.sample_rate,
+                                    chunk.timestamp,
+                                    chunk.pts_ns,
+                                    self.chunk_id_counter,
+                                    DeviceType::Microphone,  // Mixed audio
+                                );
                                 if sender.send(recording_chunk).is_err() {
                                     self.metrics.send_failure(PipelineQueue::Recording);
                                 } else {
@@ -933,13 +936,13 @@ impl AudioPipeline {
                         info!("📤 Sending final VAD segment to Whisper: {:.1}ms duration, {} samples",
                               duration_ms, segment.samples.len());
 
-                        let transcription_chunk = AudioChunk {
-                            data: segment.samples,
-                            sample_rate: 16000,
-                            timestamp: segment.start_timestamp_ms / 1000.0,
-                            chunk_id: self.chunk_id_counter,
-                            device_type: DeviceType::Microphone,
-                        };
+                        let transcription_chunk = AudioChunk::new(
+                            segment.samples,
+                            16000,
+                            segment.start_timestamp_ms / 1000.0,
+                            self.chunk_id_counter,
+                            DeviceType::Microphone,
+                        );
 
                         if let Err(e) = self.transcription_sender.send(transcription_chunk) {
                             warn!("Failed to send final VAD segment: {}", e);
@@ -1063,13 +1066,13 @@ impl AudioPipelineManager {
         // If we have a sender, send a special flush signal first
         if let Some(sender) = &self.audio_sender {
             // Create a special flush chunk to trigger immediate processing
-            let flush_chunk = AudioChunk {
-                data: vec![], // Empty data signals flush
-                sample_rate: 16000,
-                timestamp: 0.0,
-                chunk_id: u64::MAX, // Special ID to indicate flush
-                device_type: super::recording_state::DeviceType::Microphone,
-            };
+            let flush_chunk = AudioChunk::new(
+                vec![], // Empty data signals flush
+                16000,
+                0.0,
+                u64::MAX, // Special ID to indicate flush
+                super::recording_state::DeviceType::Microphone,
+            );
 
             if let Err(e) = sender.try_send(flush_chunk) {
                 match e {
@@ -1086,13 +1089,13 @@ impl AudioPipelineManager {
                 // Send multiple flush signals to ensure the pipeline catches it
                 // This aggressive approach eliminates shutdown delay issues
                 for i in 0..3 {
-                    let additional_flush = AudioChunk {
-                        data: vec![],
-                        sample_rate: 16000,
-                        timestamp: 0.0,
-                        chunk_id: u64::MAX - (i as u64),
-                        device_type: super::recording_state::DeviceType::Microphone,
-                    };
+                    let additional_flush = AudioChunk::new(
+                        vec![],
+                        16000,
+                        0.0,
+                        u64::MAX - (i as u64),
+                        super::recording_state::DeviceType::Microphone,
+                    );
                     let _ = sender.try_send(additional_flush);
                 }
 

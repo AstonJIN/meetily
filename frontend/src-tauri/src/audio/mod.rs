@@ -33,6 +33,7 @@ pub mod async_logger;
 pub mod batch_processor;
 pub mod bounded_queue;
 pub mod pipeline_metrics;
+pub mod session_clock;
 pub mod system_detector;
 pub mod system_audio_commands;
 pub mod device_monitor;  // NEW: Device disconnect/reconnect monitoring
@@ -99,6 +100,7 @@ pub use buffer_pool::{AudioBufferPool, PooledBuffer};
 pub use pipeline_metrics::{
     AudioPipelineMetrics, AudioPipelineMetricsSnapshot, PipelineQueue, QueueMetricsSnapshot,
 };
+pub use session_clock::SessionClock;
 pub use bounded_queue::{
     AudioQueueReceiver, AudioQueueSendError, AudioQueueSender, StreamingPipelineConfig,
 };
