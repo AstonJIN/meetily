@@ -31,6 +31,7 @@ pub mod post_processor;
 pub mod hardware_detector;
 pub mod async_logger;
 pub mod batch_processor;
+pub mod pipeline_metrics;
 pub mod system_detector;
 pub mod system_audio_commands;
 pub mod device_monitor;  // NEW: Device disconnect/reconnect monitoring
@@ -94,6 +95,9 @@ pub use recording_preferences::{
 pub use recording_saver::RecordingSaver;
 pub use level_monitor::{AudioLevelMonitor, AudioLevelData, AudioLevelUpdate};
 pub use buffer_pool::{AudioBufferPool, PooledBuffer};
+pub use pipeline_metrics::{
+    AudioPipelineMetrics, AudioPipelineMetricsSnapshot, PipelineQueue, QueueMetricsSnapshot,
+};
 pub use post_processor::{PostProcessor, PostProcessRequest, PostProcessResponse};
 pub use hardware_detector::{HardwareProfile, AdaptiveWhisperConfig, PerformanceTier, GpuType};
 pub use encode::{
@@ -118,4 +122,3 @@ pub use decoder::{decode_audio_file, DecodedAudio};
 
 // Export audio constants
 pub use constants::AUDIO_EXTENSIONS;
-

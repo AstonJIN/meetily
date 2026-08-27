@@ -10,6 +10,7 @@ use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolat
 
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
+use super::pipeline_metrics::{AudioPipelineMetrics, PipelineQueue};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -694,6 +695,7 @@ pub struct AudioPipeline {
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
     recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    metrics: Arc<AudioPipelineMetrics>,
 }
 
 impl AudioPipeline {
@@ -743,6 +745,7 @@ impl AudioPipeline {
 
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
         let _ = target_chunk_duration_ms;
+        let metrics = state.pipeline_metrics();
 
         Self {
             receiver,
@@ -760,6 +763,7 @@ impl AudioPipeline {
             ring_buffer,
             mixer,
             recording_sender_for_mixed: None,  // Will be set by manager
+            metrics,
         }
     }
 
@@ -778,14 +782,18 @@ impl AudioPipeline {
                 self.receiver.recv()
             ).await {
                 Ok(Some(chunk)) => {
+                    let processing_started_at = std::time::Instant::now();
                     // PERFORMANCE: Check for flush signal (special chunk with ID >= u64::MAX - 10)
                     // Multiple flush signals may be sent to ensure processing
                     if chunk.chunk_id >= u64::MAX - 10 {
                         info!("📥 Received FLUSH signal #{} - flushing VAD processor", u64::MAX - chunk.chunk_id);
                         self.flush_remaining_audio()?;
+                        self.metrics.maybe_log_summary(true);
                         // Continue processing to handle any remaining chunks
                         continue;
                     }
+
+                    self.metrics.dequeue(PipelineQueue::AudioInput);
 
                     // PERFORMANCE OPTIMIZATION: Eliminate per-chunk logging overhead
                     // Logging in hot paths causes severe performance degradation
@@ -850,8 +858,10 @@ impl AudioPipeline {
                                             };
 
                                             if let Err(e) = self.transcription_sender.send(transcription_chunk) {
+                                                self.metrics.send_failure(PipelineQueue::Transcription);
                                                 warn!("Failed to send VAD segment: {}", e);
                                             } else {
+                                                self.metrics.enqueue(PipelineQueue::Transcription);
                                                 self.chunk_id_counter += 1;
                                             }
                                         } else {
@@ -874,10 +884,20 @@ impl AudioPipeline {
                                     chunk_id: self.chunk_id_counter,
                                     device_type: DeviceType::Microphone,  // Mixed audio
                                 };
-                                let _ = sender.send(recording_chunk);
+                                if sender.send(recording_chunk).is_err() {
+                                    self.metrics.send_failure(PipelineQueue::Recording);
+                                } else {
+                                    self.metrics.enqueue(PipelineQueue::Recording);
+                                }
                             }
                         }
                     }
+
+                    self.metrics.observe_processed_chunk(
+                        processing_started_at.elapsed(),
+                        chunk.timestamp,
+                    );
+                    self.metrics.maybe_log_summary(false);
                 }
                 Ok(None) => {
                     info!("Audio pipeline: sender closed after processing {} chunks", self.processed_chunks);
@@ -892,6 +912,7 @@ impl AudioPipeline {
 
         // Flush any remaining VAD segments
         self.flush_remaining_audio()?;
+        self.metrics.maybe_log_summary(true);
 
         info!("VAD-driven audio pipeline ended");
         Ok(())

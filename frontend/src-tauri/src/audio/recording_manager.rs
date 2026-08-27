@@ -14,6 +14,7 @@ use super::recording_state::{RecordingState, AudioChunk, DeviceType as Recording
 use super::pipeline::AudioPipelineManager;
 use super::stream::AudioStreamManager;
 use super::recording_saver::RecordingSaver;
+use super::pipeline_metrics::AudioPipelineMetrics;
 use super::device_monitor::{AudioDeviceMonitor, DeviceEvent, DeviceMonitorType};
 
 /// Stream manager type enumeration
@@ -74,6 +75,7 @@ impl RecordingManager {
         // CRITICAL FIX: Create recording sender for pre-mixed audio from pipeline
         // Pipeline will mix mic + system audio professionally and send to this channel
         // Pass auto_save to control whether audio checkpoints are created
+        self.recording_saver.set_pipeline_metrics(self.state.pipeline_metrics());
         let recording_sender = self.recording_saver.start_accumulation(auto_save);
 
         // Start recording state first
@@ -389,6 +391,10 @@ impl RecordingManager {
     /// Get recording duration
     pub fn get_recording_duration(&self) -> Option<f64> {
         self.state.get_recording_duration()
+    }
+
+    pub fn get_pipeline_metrics(&self) -> Arc<AudioPipelineMetrics> {
+        self.state.pipeline_metrics()
     }
 
     /// Get active recording duration (excluding pauses)

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use super::recording_state::AudioChunk;
 use super::audio_processing::create_meeting_folder;
 use super::incremental_saver::IncrementalAudioSaver;
+use super::pipeline_metrics::{AudioPipelineMetrics, PipelineQueue};
 
 /// Structured transcript segment for JSON export
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +56,7 @@ pub struct RecordingSaver {
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
     chunk_receiver: Option<mpsc::UnboundedReceiver<AudioChunk>>,
     is_saving: Arc<Mutex<bool>>,
+    pipeline_metrics: Arc<AudioPipelineMetrics>,
 }
 
 impl RecordingSaver {
@@ -67,12 +69,17 @@ impl RecordingSaver {
             transcript_segments: Arc::new(Mutex::new(Vec::new())),
             chunk_receiver: None,
             is_saving: Arc::new(Mutex::new(false)),
+            pipeline_metrics: AudioPipelineMetrics::new(),
         }
     }
 
     /// Set the meeting name for this recording session
     pub fn set_meeting_name(&mut self, name: Option<String>) {
         self.meeting_name = name;
+    }
+
+    pub fn set_pipeline_metrics(&mut self, metrics: Arc<AudioPipelineMetrics>) {
+        self.pipeline_metrics = metrics;
     }
 
     /// Set device information in metadata
@@ -176,12 +183,14 @@ impl RecordingSaver {
         let is_saving_clone = self.is_saving.clone();
         let incremental_saver_arc = self.incremental_saver.clone();
         let save_audio = auto_save;
+        let pipeline_metrics = self.pipeline_metrics.clone();
 
         if let Some(mut receiver) = self.chunk_receiver.take() {
             tokio::spawn(async move {
                 info!("Recording saver accumulation task started (save_audio: {})", save_audio);
 
                 while let Some(chunk) = receiver.recv().await {
+                    pipeline_metrics.dequeue(PipelineQueue::Recording);
                     // Check if we should continue
                     let should_continue = if let Ok(is_saving) = is_saving_clone.lock() {
                         *is_saving

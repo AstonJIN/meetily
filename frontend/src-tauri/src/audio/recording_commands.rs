@@ -235,6 +235,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         .start_recording(microphone_device, system_device, auto_save)
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    let pipeline_metrics = manager.get_pipeline_metrics();
 
     // Store the manager globally to keep it alive
     {
@@ -248,7 +249,7 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
     reset_speech_detected_flag(); // Reset for new recording session
 
     // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
+    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver, pipeline_metrics);
     {
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
         *global_task = Some(task_handle);
@@ -403,6 +404,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         .start_recording(mic_device, system_device, auto_save)
         .await
         .map_err(|e| format!("Failed to start recording: {}", e))?;
+    let pipeline_metrics = manager.get_pipeline_metrics();
 
     // Store the manager globally to keep it alive
     {
@@ -416,7 +418,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     reset_speech_detected_flag(); // Reset for new recording session
 
     // Start optimized parallel transcription task and store handle
-    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver);
+    let task_handle = transcription::start_transcription_task(app.clone(), transcription_receiver, pipeline_metrics);
     {
         let mut global_task = TRANSCRIPTION_TASK.lock().unwrap();
         *global_task = Some(task_handle);

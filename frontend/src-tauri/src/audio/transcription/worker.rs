@@ -5,6 +5,7 @@
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
 use crate::audio::AudioChunk;
+use crate::audio::{AudioPipelineMetrics, PipelineQueue};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,6 +46,7 @@ pub struct TranscriptUpdate {
 pub fn start_transcription_task<R: Runtime>(
     app: AppHandle<R>,
     transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
+    metrics: Arc<AudioPipelineMetrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         info!("🚀 Starting optimized parallel transcription task - guaranteeing zero chunk loss");
@@ -323,6 +325,7 @@ pub fn start_transcription_task<R: Runtime>(
         // Main dispatcher: receive chunks and distribute to workers
         let mut receiver = transcription_receiver;
         while let Some(chunk) = receiver.recv().await {
+            metrics.dequeue(PipelineQueue::Transcription);
             let queued = chunks_queued.fetch_add(1, Ordering::SeqCst) + 1;
             info!(
                 "📥 Dispatching chunk {} to workers (total queued: {})",

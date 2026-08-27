@@ -6,6 +6,7 @@ use anyhow::Result;
 
 use super::devices::AudioDevice;
 use super::buffer_pool::AudioBufferPool;
+use super::pipeline_metrics::{AudioPipelineMetrics, PipelineQueue};
 
 /// Device type for audio chunks
 #[derive(Debug, Clone, PartialEq)]
@@ -106,6 +107,7 @@ pub struct RecordingState {
 
     // Audio pipeline
     audio_sender: Mutex<Option<mpsc::UnboundedSender<AudioChunk>>>,
+    pipeline_metrics: Arc<AudioPipelineMetrics>,
 
     // Memory optimization
     buffer_pool: AudioBufferPool,
@@ -136,6 +138,7 @@ impl RecordingState {
             system_device: Mutex::new(None),
             disconnected_device: Mutex::new(None),
             audio_sender: Mutex::new(None),
+            pipeline_metrics: AudioPipelineMetrics::new(),
             buffer_pool: AudioBufferPool::new(16, 48000), // Pool of 16 buffers with 48kHz samples capacity
             error_count: AtomicU32::new(0),
             recoverable_error_count: AtomicU32::new(0),
@@ -150,6 +153,7 @@ impl RecordingState {
 
     // Recording control
     pub fn start_recording(&self) -> Result<()> {
+        self.pipeline_metrics.start_session();
         self.is_recording.store(true, Ordering::SeqCst);
         *self.recording_start.lock().unwrap() = Some(Instant::now());
         self.error_count.store(0, Ordering::SeqCst);
@@ -269,7 +273,11 @@ impl RecordingState {
         }
 
         if let Some(sender) = self.audio_sender.lock().unwrap().as_ref() {
-            sender.send(chunk).map_err(|_| anyhow::anyhow!("Failed to send audio chunk"))?;
+            sender.send(chunk).map_err(|_| {
+                self.pipeline_metrics.send_failure(PipelineQueue::AudioInput);
+                anyhow::anyhow!("Failed to send audio chunk")
+            })?;
+            self.pipeline_metrics.enqueue(PipelineQueue::AudioInput);
 
             // Update statistics
             let mut stats = self.stats.lock().unwrap();
@@ -280,6 +288,10 @@ impl RecordingState {
             // Return an error when no sender is available (pipeline not ready)
             Err(anyhow::anyhow!("Audio pipeline not ready - no sender available"))
         }
+    }
+
+    pub fn pipeline_metrics(&self) -> Arc<AudioPipelineMetrics> {
+        self.pipeline_metrics.clone()
     }
 
     // Error handling
@@ -424,6 +436,7 @@ impl Default for RecordingState {
             system_device: Mutex::new(None),
             disconnected_device: Mutex::new(None),
             audio_sender: Mutex::new(None),
+            pipeline_metrics: AudioPipelineMetrics::new(),
             buffer_pool: AudioBufferPool::new(16, 48000), // Pool of 16 buffers with 48kHz samples capacity
             error_count: AtomicU32::new(0),
             recoverable_error_count: AtomicU32::new(0),
