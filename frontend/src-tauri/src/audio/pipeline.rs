@@ -695,7 +695,7 @@ pub struct AudioPipeline {
     ring_buffer: AudioMixerRingBuffer,
     mixer: ProfessionalAudioMixer,
     // Recording sender for pre-mixed audio
-    recording_sender_for_mixed: Option<mpsc::UnboundedSender<AudioChunk>>,
+    recording_sender_for_mixed: Option<AudioQueueSender<AudioChunk>>,
     metrics: Arc<AudioPipelineMetrics>,
 }
 
@@ -881,10 +881,18 @@ impl AudioPipeline {
                                     self.chunk_id_counter,
                                     DeviceType::Microphone,  // Mixed audio
                                 );
-                                if sender.send(recording_chunk).is_err() {
-                                    self.metrics.send_failure(PipelineQueue::Recording);
-                                } else {
-                                    self.metrics.enqueue(PipelineQueue::Recording);
+                                match sender.try_send(recording_chunk) {
+                                    Ok(()) => self.metrics.enqueue(PipelineQueue::Recording),
+                                    Err(AudioQueueSendError::Full(_)) => {
+                                        self.metrics.send_failure(PipelineQueue::Recording);
+                                        self.state.report_error(AudioError::BufferOverflow);
+                                        warn!("recording_degraded reason=queue_full");
+                                    }
+                                    Err(AudioQueueSendError::Closed(_)) => {
+                                        self.metrics.send_failure(PipelineQueue::Recording);
+                                        self.state.report_error(AudioError::ChannelClosed);
+                                        warn!("recording_degraded reason=queue_closed");
+                                    }
                                 }
                             }
                         }
@@ -1015,7 +1023,7 @@ impl AudioPipelineManager {
         transcription_sender: AudioQueueSender<AudioChunk>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
-        recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+        recording_sender: Option<AudioQueueSender<AudioChunk>>,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
@@ -1071,6 +1079,10 @@ impl AudioPipelineManager {
         &self,
     ) -> (AudioQueueSender<AudioChunk>, AudioQueueReceiver<AudioChunk>) {
         create_transcription_queue(self.streaming_config)
+    }
+
+    pub fn streaming_config(&self) -> StreamingPipelineConfig {
+        self.streaming_config
     }
 
     /// Stop the audio pipeline

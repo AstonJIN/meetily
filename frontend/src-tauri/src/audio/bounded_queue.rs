@@ -11,9 +11,11 @@ use tokio::sync::mpsc;
 pub const STREAMING_PIPELINE_ENV: &str = "MEETILY_STREAMING_PIPELINE_V1";
 pub const AUDIO_INPUT_QUEUE_CAPACITY_ENV: &str = "MEETILY_AUDIO_INPUT_QUEUE_CAPACITY";
 pub const TRANSCRIPTION_QUEUE_CAPACITY_ENV: &str = "MEETILY_TRANSCRIPTION_QUEUE_CAPACITY";
+pub const RECORDING_QUEUE_CAPACITY_ENV: &str = "MEETILY_RECORDING_QUEUE_CAPACITY";
 pub const AUDIO_MIX_WINDOW_MS_ENV: &str = "MEETILY_AUDIO_MIX_WINDOW_MS";
 pub const DEFAULT_AUDIO_INPUT_QUEUE_CAPACITY: usize = 64;
 pub const DEFAULT_TRANSCRIPTION_QUEUE_CAPACITY: usize = 8;
+pub const DEFAULT_RECORDING_QUEUE_CAPACITY: usize = 256;
 pub const DEFAULT_STREAMING_MIX_WINDOW_MS: u32 = 40;
 pub const LEGACY_MIX_WINDOW_MS: u32 = 600;
 
@@ -22,6 +24,7 @@ pub struct StreamingPipelineConfig {
     pub enabled: bool,
     pub audio_input_capacity: usize,
     pub transcription_capacity: usize,
+    pub recording_capacity: usize,
     pub mix_window_ms: u32,
 }
 
@@ -31,6 +34,7 @@ impl Default for StreamingPipelineConfig {
             enabled: false,
             audio_input_capacity: DEFAULT_AUDIO_INPUT_QUEUE_CAPACITY,
             transcription_capacity: DEFAULT_TRANSCRIPTION_QUEUE_CAPACITY,
+            recording_capacity: DEFAULT_RECORDING_QUEUE_CAPACITY,
             mix_window_ms: DEFAULT_STREAMING_MIX_WINDOW_MS,
         }
     }
@@ -51,12 +55,18 @@ impl StreamingPipelineConfig {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|capacity| *capacity > 0)
             .unwrap_or(DEFAULT_TRANSCRIPTION_QUEUE_CAPACITY);
+        let recording_capacity = env::var(RECORDING_QUEUE_CAPACITY_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|capacity| *capacity > 0)
+            .unwrap_or(DEFAULT_RECORDING_QUEUE_CAPACITY);
         let mix_window_ms = parse_mix_window_ms(env::var(AUDIO_MIX_WINDOW_MS_ENV).ok().as_deref());
 
         Self {
             enabled,
             audio_input_capacity,
             transcription_capacity,
+            recording_capacity,
             mix_window_ms,
         }
     }
@@ -168,6 +178,16 @@ pub fn create_transcription_queue(
     }
 }
 
+pub fn create_recording_queue(
+    config: StreamingPipelineConfig,
+) -> (AudioQueueSender<crate::audio::AudioChunk>, AudioQueueReceiver<crate::audio::AudioChunk>) {
+    if config.enabled {
+        bounded(config.recording_capacity)
+    } else {
+        unbounded()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,9 +221,23 @@ mod tests {
             enabled: true,
             audio_input_capacity: 3,
             transcription_capacity: 2,
+            recording_capacity: 4,
             mix_window_ms: 40,
         };
         let (sender, _receiver) = create_audio_input_queue(config);
+        assert!(sender.is_bounded());
+    }
+
+    #[test]
+    fn enabled_config_selects_bounded_recording_queue() {
+        let config = StreamingPipelineConfig {
+            enabled: true,
+            audio_input_capacity: 3,
+            transcription_capacity: 2,
+            recording_capacity: 4,
+            mix_window_ms: 40,
+        };
+        let (sender, _receiver) = create_recording_queue(config);
         assert!(sender.is_bounded());
     }
 

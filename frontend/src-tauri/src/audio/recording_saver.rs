@@ -3,7 +3,6 @@ use tokio::sync::Mutex as AsyncMutex;
 use anyhow::Result;
 use log::{info, warn, error};
 use tauri::{AppHandle, Runtime, Emitter};
-use tokio::sync::mpsc;
 use serde::{Serialize, Deserialize};
 use std::path::PathBuf;
 
@@ -11,6 +10,7 @@ use super::recording_state::AudioChunk;
 use super::audio_processing::create_meeting_folder;
 use super::incremental_saver::IncrementalAudioSaver;
 use super::pipeline_metrics::{AudioPipelineMetrics, PipelineQueue};
+use super::bounded_queue::{create_recording_queue, AudioQueueReceiver, AudioQueueSender, StreamingPipelineConfig};
 
 /// Structured transcript segment for JSON export
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +54,7 @@ pub struct RecordingSaver {
     meeting_name: Option<String>,
     metadata: Option<MeetingMetadata>,
     transcript_segments: Arc<Mutex<Vec<TranscriptSegment>>>,
-    chunk_receiver: Option<mpsc::UnboundedReceiver<AudioChunk>>,
+    chunk_receiver: Option<AudioQueueReceiver<AudioChunk>>,
     is_saving: Arc<Mutex<bool>>,
     pipeline_metrics: Arc<AudioPipelineMetrics>,
 }
@@ -144,7 +144,11 @@ impl RecordingSaver {
     ///
     /// # Arguments
     /// * `auto_save` - If true, creates checkpoints and enables saving. If false, audio chunks are discarded.
-    pub fn start_accumulation(&mut self, auto_save: bool) -> mpsc::UnboundedSender<AudioChunk> {
+    pub fn start_accumulation(
+        &mut self,
+        auto_save: bool,
+        streaming_config: StreamingPipelineConfig,
+    ) -> AudioQueueSender<AudioChunk> {
         if auto_save {
             info!("Initializing incremental audio saver for recording (auto-save ENABLED)");
         } else {
@@ -152,7 +156,7 @@ impl RecordingSaver {
         }
 
         // Create channel for receiving audio chunks
-        let (sender, receiver) = mpsc::unbounded_channel::<AudioChunk>();
+        let (sender, receiver) = create_recording_queue(streaming_config);
         self.chunk_receiver = Some(receiver);
 
         // Initialize meeting folder and incremental saver ONLY if auto_save is enabled
