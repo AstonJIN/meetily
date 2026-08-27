@@ -52,6 +52,15 @@ export function useRecordingStart(
   // Check if Parakeet transcription model is ready
   const checkParakeetReady = useCallback(async (): Promise<boolean> => {
     try {
+      const transcriptConfig = await invoke<{ provider?: string; model?: string } | null>('api_get_transcript_config');
+      if (transcriptConfig?.provider === 'zipformer') {
+        await invoke('zipformer_validate_model', {
+          modelDir: transcriptConfig.model?.trim() || null,
+        });
+        console.log('Zipformer model directory is ready');
+        return true;
+      }
+
       await invoke('parakeet_init');
       const hasModels = await invoke<boolean>('parakeet_has_available_models');
       return hasModels;

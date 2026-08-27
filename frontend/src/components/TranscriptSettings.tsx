@@ -10,7 +10,7 @@ import { ParakeetModelManager } from './ParakeetModelManager';
 
 
 export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
+    provider: 'localWhisper' | 'parakeet' | 'zipformer' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
     model: string;
     apiKey?: string | null;
 }
@@ -27,6 +27,10 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [isApiKeyLocked, setIsApiKeyLocked] = useState<boolean>(true);
     const [isLockButtonVibrating, setIsLockButtonVibrating] = useState<boolean>(false);
     const [uiProvider, setUiProvider] = useState<TranscriptModelProps['provider']>(transcriptModelConfig.provider);
+    const [zipformerValidation, setZipformerValidation] = useState<{
+        state: 'idle' | 'checking' | 'valid' | 'invalid';
+        message: string;
+    }>({ state: 'idle', message: '' });
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
@@ -34,7 +38,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     }, [transcriptModelConfig.provider]);
 
     useEffect(() => {
-        if (transcriptModelConfig.provider === 'localWhisper' || transcriptModelConfig.provider === 'parakeet') {
+        if (transcriptModelConfig.provider === 'localWhisper' || transcriptModelConfig.provider === 'parakeet' || transcriptModelConfig.provider === 'zipformer') {
             setApiKey(null);
         }
     }, [transcriptModelConfig.provider]);
@@ -57,6 +61,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         elevenLabs: ['eleven_multilingual_v2'],
         groq: ['llama-3.3-70b-versatile'],
         openai: ['gpt-4o'],
+        zipformer: [], // Model directory is configured below
     };
     const requiresApiKey = transcriptModelConfig.provider === 'deepgram' || transcriptModelConfig.provider === 'elevenLabs' || transcriptModelConfig.provider === 'openai' || transcriptModelConfig.provider === 'groq';
 
@@ -95,6 +100,50 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         }
     };
 
+    const persistZipformerSelection = async (config: TranscriptModelProps) => {
+        await invoke('api_save_transcript_config', {
+            provider: config.provider,
+            model: config.model,
+            apiKey: null,
+        });
+    };
+
+    const handleZipformerModelDirChange = (modelDir: string) => {
+        setZipformerValidation({ state: 'idle', message: '' });
+        setTranscriptModelConfig({
+            ...transcriptModelConfig,
+            provider: 'zipformer',
+            model: modelDir,
+            apiKey: null,
+        });
+    };
+
+    const validateAndSaveZipformer = async () => {
+        const modelDir = transcriptModelConfig.model.trim();
+        setZipformerValidation({ state: 'checking', message: '正在验证模型文件…' });
+
+        try {
+            const validation = await invoke<{ model_dir: string }>('zipformer_validate_model', {
+                modelDir: modelDir || null,
+            });
+            const savedConfig = {
+                ...transcriptModelConfig,
+                provider: 'zipformer' as const,
+                model: validation.model_dir,
+                apiKey: null,
+            };
+            setTranscriptModelConfig(savedConfig);
+            await persistZipformerSelection(savedConfig);
+            setZipformerValidation({
+                state: 'valid',
+                message: `模型文件已验证：${validation.model_dir}`,
+            });
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            setZipformerValidation({ state: 'invalid', message });
+        }
+    };
+
     return (
         <div>
             <div>
@@ -112,7 +161,19 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 onValueChange={(value) => {
                                     const provider = value as TranscriptModelProps['provider'];
                                     setUiProvider(provider);
-                                    if (provider !== 'localWhisper' && provider !== 'parakeet') {
+                                    if (provider === 'zipformer') {
+                                        const nextConfig = {
+                                            ...transcriptModelConfig,
+                                            provider,
+                                            model: transcriptModelConfig.provider === 'zipformer' ? transcriptModelConfig.model : '',
+                                            apiKey: null,
+                                        };
+                                        setTranscriptModelConfig(nextConfig);
+                                        setZipformerValidation({ state: 'idle', message: '' });
+                                        void persistZipformerSelection(nextConfig).catch((error) => {
+                                            console.error('Failed to save Zipformer selection:', error);
+                                        });
+                                    } else if (provider !== 'localWhisper' && provider !== 'parakeet') {
                                         fetchApiKey(provider);
                                     }
                                 }}
@@ -123,6 +184,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 <SelectContent>
                                     <SelectItem value="parakeet">⚡ Parakeet (Recommended - Real-time / Accurate)</SelectItem>
                                     <SelectItem value="localWhisper">🏠 Local Whisper (High Accuracy)</SelectItem>
+                                    <SelectItem value="zipformer">🧪 Zipformer (sherpa-onnx streaming test)</SelectItem>
                                     {/* <SelectItem value="deepgram">☁️ Deepgram (Backup)</SelectItem>
                                     <SelectItem value="elevenLabs">☁️ ElevenLabs</SelectItem>
                                     <SelectItem value="groq">☁️ Groq</SelectItem>
@@ -130,7 +192,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 </SelectContent>
                             </Select>
 
-                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && (
+                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && uiProvider !== 'zipformer' && (
                                 <Select
                                     value={transcriptModelConfig.model}
                                     onValueChange={(value) => {
@@ -169,6 +231,37 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 onModelSelect={handleParakeetModelSelect}
                                 autoSave={true}
                             />
+                        </div>
+                    )}
+
+                    {uiProvider === 'zipformer' && (
+                        <div className="mt-6 space-y-3 rounded-md border border-blue-200 bg-blue-50 p-4">
+                            <div>
+                                <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                    Zipformer model directory
+                                </Label>
+                                <Input
+                                    value={transcriptModelConfig.provider === 'zipformer' ? transcriptModelConfig.model : ''}
+                                    onChange={(event) => handleZipformerModelDirChange(event.target.value)}
+                                    placeholder="留空使用默认模型目录，或输入已解压模型目录的绝对路径"
+                                    className="bg-white"
+                                />
+                                <p className="mt-1 text-xs text-gray-600">
+                                    需要包含 encoder、decoder、joiner 和 tokens.txt。当前为开发测试入口，失败时保留 Whisper/Parakeet 回退。
+                                </p>
+                            </div>
+                            <Button
+                                type="button"
+                                onClick={validateAndSaveZipformer}
+                                disabled={zipformerValidation.state === 'checking'}
+                            >
+                                {zipformerValidation.state === 'checking' ? '验证中…' : '验证并保存 Zipformer'}
+                            </Button>
+                            {zipformerValidation.state !== 'idle' && zipformerValidation.state !== 'checking' && (
+                                <p className={`text-xs ${zipformerValidation.state === 'valid' ? 'text-green-700' : 'text-red-700'}`}>
+                                    {zipformerValidation.message}
+                                </p>
+                            )}
                         </div>
                     )}
 
@@ -224,8 +317,6 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         </div >
     )
 }
-
-
 
 
 

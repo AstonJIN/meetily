@@ -104,15 +104,30 @@ pub struct ZipformerRuntimeConfig {
 }
 
 impl ZipformerRuntimeConfig {
-    pub fn from_environment() -> Result<Self, String> {
+    pub fn from_model_dir(root: impl Into<PathBuf>) -> Result<Self, String> {
         let num_threads = parse_num_threads(
             std::env::var(ZIPFORMER_NUM_THREADS_ENV).ok().as_deref(),
         )?;
         Ok(Self {
-            model: ZipformerModelPaths::from_environment()?,
+            model: ZipformerModelPaths::from_dir(root)?,
             num_threads,
             hotwords_file: std::env::var_os(ZIPFORMER_HOTWORDS_FILE_ENV).map(PathBuf::from),
         })
+    }
+
+    pub fn from_environment() -> Result<Self, String> {
+        let model = if let Some(path) = std::env::var_os(ZIPFORMER_MODEL_DIR_ENV) {
+            PathBuf::from(path)
+        } else {
+            let home = dirs::home_dir().ok_or_else(|| {
+                format!(
+                    "{} is not set and the home directory could not be resolved",
+                    ZIPFORMER_MODEL_DIR_ENV
+                )
+            })?;
+            ZipformerModelPaths::default_home_dir(&home)
+        };
+        Self::from_model_dir(model)
     }
 }
 
@@ -194,6 +209,11 @@ pub struct ZipformerProvider {
 impl ZipformerProvider {
     pub fn from_environment() -> Result<Self, String> {
         let runtime = ZipformerRuntimeConfig::from_environment()?;
+        Self::from_runtime_config(runtime)
+    }
+
+    pub fn from_model_dir(root: impl Into<PathBuf>) -> Result<Self, String> {
+        let runtime = ZipformerRuntimeConfig::from_model_dir(root)?;
         Self::from_runtime_config(runtime)
     }
 
@@ -428,6 +448,37 @@ impl ZipformerProvider {
     }
 }
 
+#[derive(Debug, serde::Serialize)]
+pub struct ZipformerModelValidation {
+    pub model_dir: String,
+    pub encoder: String,
+    pub decoder: String,
+    pub joiner: String,
+    pub tokens: String,
+}
+
+/// Validate a Zipformer model directory without loading the native recognizer.
+///
+/// The UI uses this command before saving a model directory so an invalid path
+/// is visible during setup instead of only failing when recording starts.
+#[tauri::command]
+pub fn zipformer_validate_model(
+    model_dir: Option<String>,
+) -> Result<ZipformerModelValidation, String> {
+    let paths = match model_dir.as_deref().map(str::trim) {
+        Some(path) if !path.is_empty() => ZipformerModelPaths::from_dir(path)?,
+        _ => ZipformerModelPaths::from_environment()?,
+    };
+
+    Ok(ZipformerModelValidation {
+        model_dir: paths.root.display().to_string(),
+        encoder: paths.encoder.display().to_string(),
+        decoder: paths.decoder.display().to_string(),
+        joiner: paths.joiner.display().to_string(),
+        tokens: paths.tokens.display().to_string(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +496,34 @@ mod tests {
         assert_eq!(paths.decoder.file_name().unwrap(), DECODER_FILE);
         assert_eq!(paths.joiner.file_name().unwrap(), JOINER_FILE);
         assert_eq!(paths.tokens.file_name().unwrap(), TOKENS_FILE);
+    }
+
+    #[test]
+    fn runtime_config_uses_selected_model_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        for file in [ENCODER_FILE, DECODER_FILE, JOINER_FILE, TOKENS_FILE] {
+            fs::write(temp.path().join(file), b"model").expect("model fixture");
+        }
+
+        let config = ZipformerRuntimeConfig::from_model_dir(temp.path())
+            .expect("selected model directory should be accepted");
+        assert_eq!(config.model.root, temp.path());
+    }
+
+    #[test]
+    fn model_validation_command_reports_all_required_files() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        for file in [ENCODER_FILE, DECODER_FILE, JOINER_FILE, TOKENS_FILE] {
+            fs::write(temp.path().join(file), b"model").expect("model fixture");
+        }
+
+        let validation = zipformer_validate_model(Some(temp.path().display().to_string()))
+            .expect("model validation");
+        assert_eq!(validation.model_dir, temp.path().display().to_string());
+        assert!(validation.encoder.ends_with(ENCODER_FILE));
+        assert!(validation.decoder.ends_with(DECODER_FILE));
+        assert!(validation.joiner.ends_with(JOINER_FILE));
+        assert!(validation.tokens.ends_with(TOKENS_FILE));
     }
 
     #[test]
@@ -503,7 +582,10 @@ mod tests {
     #[test]
     #[ignore = "requires the downloaded Zipformer archive and native sherpa-onnx runtime"]
     fn replays_downloaded_bilingual_fixture() {
-        let provider = ZipformerProvider::from_environment().expect("Zipformer model");
+        let provider = std::env::var(ZIPFORMER_MODEL_DIR_ENV)
+            .map(ZipformerProvider::from_model_dir)
+            .unwrap_or_else(|_| ZipformerProvider::from_environment())
+            .expect("Zipformer model");
         let wav_path = provider.model_root().join("test_wavs/0.wav");
         let wav = sherpa_onnx::Wave::read(wav_path.to_str().expect("UTF-8 wav path"))
             .expect("test wav");

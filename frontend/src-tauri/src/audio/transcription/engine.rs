@@ -5,6 +5,7 @@
 use super::provider::TranscriptionProvider;
 use super::zipformer_provider::{pilot_enabled, StreamingAsrEngine, ZipformerProvider};
 use log::{info, warn};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tauri::{AppHandle, Manager, Runtime};
 
@@ -56,6 +57,14 @@ impl TranscriptionEngine {
 // MODEL VALIDATION AND INITIALIZATION
 // ============================================================================
 
+fn zipformer_provider_for_config(model: &str) -> Result<ZipformerProvider, String> {
+    if model.trim().is_empty() {
+        ZipformerProvider::from_environment()
+    } else {
+        ZipformerProvider::from_model_dir(PathBuf::from(model.trim()))
+    }
+}
+
 /// Validate that transcription models (Whisper or Parakeet) are ready before starting recording
 pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // Check transcript configuration to determine which engine to validate
@@ -95,7 +104,7 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
     // validation. This prevents loading a second heavy ASR model when the
     // Zipformer runtime is available, while an initialization failure falls
     // through to the configured legacy provider below.
-    if pilot_enabled() {
+    if pilot_enabled() && config.provider != "zipformer" {
         unload_legacy_asr_models().await;
         match ZipformerProvider::from_environment() {
             Ok(provider) => {
@@ -115,8 +124,49 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
         }
     }
 
-    // Validate based on provider
-    match config.provider.as_str() {
+    if config.provider == "zipformer" {
+        info!("🔍 Validating Zipformer model directory...");
+        unload_legacy_asr_models().await;
+        match zipformer_provider_for_config(&config.model) {
+            Ok(provider) => {
+                info!(
+                    "✅ Zipformer model validation successful: {} is ready",
+                    provider.model_root().display()
+                );
+                provider.unload();
+                return Ok(());
+            }
+            Err(zipformer_error) => {
+                warn!(
+                    "⚠️ Zipformer validation failed; trying Parakeet then Whisper fallback: {}",
+                    zipformer_error
+                );
+
+                if let Err(parakeet_error) = validate_legacy_provider_ready(app, "parakeet").await {
+                    warn!("⚠️ Parakeet fallback validation failed: {}", parakeet_error);
+                    if let Err(whisper_error) = validate_legacy_provider_ready(app, "localWhisper").await {
+                        return Err(format!(
+                            "Zipformer is unavailable ({}); Parakeet fallback failed ({}); Whisper fallback failed ({})",
+                            zipformer_error, parakeet_error, whisper_error
+                        ));
+                    }
+                    warn!("↩️ Using Whisper fallback after Zipformer and Parakeet failure");
+                } else {
+                    warn!("↩️ Using Parakeet fallback after Zipformer failure");
+                }
+                return Ok(());
+            }
+        }
+    }
+
+    validate_legacy_provider_ready(app, &config.provider).await
+}
+
+async fn validate_legacy_provider_ready<R: Runtime>(
+    app: &AppHandle<R>,
+    provider: &str,
+) -> Result<(), String> {
+    match provider {
         "localWhisper" => {
             info!("🔍 Validating Whisper model...");
             // Ensure whisper engine is initialized first
@@ -242,7 +292,7 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
     // Zipformer is a development-only override. If it cannot be initialized,
     // continue through the existing provider selection below so Whisper and
     // Parakeet remain the operational fallback paths.
-    if pilot_enabled() {
+    if pilot_enabled() && config.provider != "zipformer" {
         match ZipformerProvider::from_environment() {
             Ok(provider) => {
                 info!(
@@ -257,6 +307,26 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
                     "⚠️ Zipformer pilot initialization failed; preserving configured fallback: {}",
                     error
                 );
+            }
+        }
+    }
+
+    if config.provider == "zipformer" {
+        match zipformer_provider_for_config(&config.model) {
+            Ok(provider) => {
+                unload_legacy_asr_models().await;
+                info!(
+                    "🧪 Zipformer selected from transcript settings using model directory {}",
+                    provider.model_root().display()
+                );
+                return Ok(TranscriptionEngine::Zipformer(Arc::new(provider)));
+            }
+            Err(error) => {
+                warn!(
+                    "⚠️ Zipformer initialization failed; preserving Parakeet/Whisper fallback: {}",
+                    error
+                );
+                return get_or_init_legacy_fallback(app).await;
             }
         }
     }
@@ -297,6 +367,28 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
             Ok(TranscriptionEngine::Whisper(whisper_engine))
         }
     }
+}
+
+async fn get_or_init_legacy_fallback<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<TranscriptionEngine, String> {
+    let parakeet = {
+        let guard = crate::parakeet_engine::commands::PARAKEET_ENGINE
+            .lock()
+            .unwrap();
+        guard.as_ref().cloned()
+    };
+
+    if let Some(engine) = parakeet {
+        if engine.is_model_loaded().await {
+            info!("↩️ Reusing loaded Parakeet fallback engine");
+            return Ok(TranscriptionEngine::Parakeet(engine));
+        }
+    }
+
+    let whisper = get_or_init_whisper(app).await?;
+    info!("↩️ Using Whisper fallback engine");
+    Ok(TranscriptionEngine::Whisper(whisper))
 }
 
 /// Get or initialize transcription engine using API configuration
@@ -412,6 +504,12 @@ pub async fn get_or_init_whisper<R: Runtime>(
                 if config.provider == "localWhisper" {
                     info!("Using model from API config: {}", config.model);
                     config.model
+                } else if config.provider == "zipformer" {
+                    info!(
+                        "Zipformer fallback requested; selecting default Whisper model '{}'",
+                        crate::config::DEFAULT_WHISPER_MODEL
+                    );
+                    crate::config::DEFAULT_WHISPER_MODEL.to_string()
                 } else {
                     // Non-Whisper provider (e.g., parakeet) - this function shouldn't be called
                     return Err(format!(
