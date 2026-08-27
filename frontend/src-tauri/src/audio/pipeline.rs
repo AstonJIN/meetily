@@ -11,7 +11,7 @@ use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolat
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
 use super::pipeline_metrics::{AudioPipelineMetrics, PipelineQueue};
-use super::bounded_queue::{create_audio_input_queue, AudioQueueReceiver, AudioQueueSendError, AudioQueueSender, StreamingPipelineConfig};
+use super::bounded_queue::{create_audio_input_queue, create_transcription_queue, AudioQueueReceiver, AudioQueueSendError, AudioQueueSender, StreamingPipelineConfig};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -681,7 +681,7 @@ impl AudioCapture {
 /// Uses Voice Activity Detection to segment speech in real-time and send only speech to Whisper
 pub struct AudioPipeline {
     receiver: AudioQueueReceiver<AudioChunk>,
-    transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+    transcription_sender: AudioQueueSender<AudioChunk>,
     state: Arc<RecordingState>,
     vad_processor: ContinuousVadProcessor,
     sample_rate: u32,
@@ -702,7 +702,7 @@ pub struct AudioPipeline {
 impl AudioPipeline {
     pub fn new(
         receiver: AudioQueueReceiver<AudioChunk>,
-        transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+        transcription_sender: AudioQueueSender<AudioChunk>,
         state: Arc<RecordingState>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
@@ -859,13 +859,7 @@ impl AudioPipeline {
                                                 DeviceType::Microphone,  // Mixed audio
                                             );
 
-                                            if let Err(e) = self.transcription_sender.send(transcription_chunk) {
-                                                self.metrics.send_failure(PipelineQueue::Transcription);
-                                                warn!("Failed to send VAD segment: {}", e);
-                                            } else {
-                                                self.metrics.enqueue(PipelineQueue::Transcription);
-                                                self.chunk_id_counter += 1;
-                                            }
+                                            self.enqueue_transcription_chunk(transcription_chunk);
                                         } else {
                                             debug!("⏭️ Dropping short VAD segment: {:.1}ms ({} samples < 800)",
                                                    duration_ms, segment.samples.len());
@@ -943,11 +937,7 @@ impl AudioPipeline {
                             DeviceType::Microphone,
                         );
 
-                        if let Err(e) = self.transcription_sender.send(transcription_chunk) {
-                            warn!("Failed to send final VAD segment: {}", e);
-                        } else {
-                            self.chunk_id_counter += 1;
-                        }
+                        self.enqueue_transcription_chunk(transcription_chunk);
                     } else {
                         info!("⏭️ Skipping short final segment: {:.1}ms ({} samples < 800)",
                               duration_ms, segment.samples.len());
@@ -960,6 +950,44 @@ impl AudioPipeline {
         }
 
         Ok(())
+    }
+
+    fn enqueue_transcription_chunk(&mut self, chunk: AudioChunk) {
+        let chunk_id = chunk.chunk_id;
+        let start_s = chunk.timestamp;
+        let duration_s = if chunk.sample_rate == 0 {
+            0.0
+        } else {
+            chunk.data.len() as f64 / chunk.sample_rate as f64
+        };
+        let end_s = if start_s.is_finite() {
+            start_s.max(0.0) + duration_s
+        } else {
+            duration_s
+        };
+
+        match self.transcription_sender.try_send(chunk) {
+            Ok(()) => {
+                self.metrics.enqueue(PipelineQueue::Transcription);
+            }
+            Err(AudioQueueSendError::Full(_chunk)) => {
+                self.metrics.send_failure(PipelineQueue::Transcription);
+                self.metrics.record_transcription_degraded(start_s, end_s);
+                warn!(
+                    "transcription_degraded reason=queue_full chunk_id={} audio_range={:.3}-{:.3}s",
+                    chunk_id, start_s, end_s
+                );
+            }
+            Err(AudioQueueSendError::Closed(_chunk)) => {
+                self.metrics.send_failure(PipelineQueue::Transcription);
+                warn!(
+                    "transcription_degraded reason=queue_closed chunk_id={} audio_range={:.3}-{:.3}s",
+                    chunk_id, start_s, end_s
+                );
+            }
+        }
+
+        self.chunk_id_counter = self.chunk_id_counter.saturating_add(1);
     }
 
 }
@@ -984,7 +1012,7 @@ impl AudioPipelineManager {
     pub fn start(
         &mut self,
         state: Arc<RecordingState>,
-        transcription_sender: mpsc::UnboundedSender<AudioChunk>,
+        transcription_sender: AudioQueueSender<AudioChunk>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
         recording_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
@@ -1037,6 +1065,12 @@ impl AudioPipelineManager {
 
         info!("Audio pipeline manager started with mixed audio recording");
         Ok(())
+    }
+
+    pub fn create_transcription_queue(
+        &self,
+    ) -> (AudioQueueSender<AudioChunk>, AudioQueueReceiver<AudioChunk>) {
+        create_transcription_queue(self.streaming_config)
     }
 
     /// Stop the audio pipeline

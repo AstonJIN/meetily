@@ -5,7 +5,7 @@
 use super::engine::TranscriptionEngine;
 use super::provider::TranscriptionError;
 use crate::audio::AudioChunk;
-use crate::audio::{AudioPipelineMetrics, PipelineQueue};
+use crate::audio::{AudioPipelineMetrics, AudioQueueReceiver, PipelineQueue};
 use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,7 +45,7 @@ pub struct TranscriptUpdate {
 /// Optimized parallel transcription task ensuring ZERO chunk loss
 pub fn start_transcription_task<R: Runtime>(
     app: AppHandle<R>,
-    transcription_receiver: tokio::sync::mpsc::UnboundedReceiver<AudioChunk>,
+    transcription_receiver: AudioQueueReceiver<AudioChunk>,
     metrics: Arc<AudioPipelineMetrics>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {

@@ -8,6 +8,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use std::collections::VecDeque;
 
 use log::info;
 use sysinfo::{get_current_pid, ProcessesToUpdate, System};
@@ -46,7 +47,24 @@ pub struct AudioPipelineMetricsSnapshot {
     pub rss_bytes: Option<u64>,
     pub rss_peak_bytes: Option<u64>,
     pub latest_audio_timestamp_s: Option<f64>,
+    pub transcription_degraded_events: u64,
+    pub recoverable_ranges: Vec<AudioRange>,
+    pub recovery_ranges_dropped: u64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AudioRange {
+    pub start_s: f64,
+    pub end_s: f64,
+}
+
+#[derive(Debug, Default)]
+struct DegradedState {
+    ranges: VecDeque<AudioRange>,
+    dropped_ranges: u64,
+}
+
+const MAX_RECOVERABLE_RANGES: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 struct QueueState {
@@ -109,6 +127,8 @@ pub struct AudioPipelineMetrics {
     rss_peak_bytes: AtomicU64,
     latest_audio_timestamp_bits: AtomicU64,
     has_latest_audio_timestamp: AtomicU64,
+    transcription_degraded_events: AtomicU64,
+    degraded: Mutex<DegradedState>,
     last_report_ms: AtomicU64,
 }
 
@@ -126,6 +146,8 @@ impl AudioPipelineMetrics {
             rss_peak_bytes: AtomicU64::new(0),
             latest_audio_timestamp_bits: AtomicU64::new(0),
             has_latest_audio_timestamp: AtomicU64::new(0),
+            transcription_degraded_events: AtomicU64::new(0),
+            degraded: Mutex::new(DegradedState::default()),
             last_report_ms: AtomicU64::new(0),
         })
     }
@@ -147,6 +169,10 @@ impl AudioPipelineMetrics {
         self.rss_peak_bytes.store(0, Ordering::Relaxed);
         self.latest_audio_timestamp_bits.store(0, Ordering::Relaxed);
         self.has_latest_audio_timestamp.store(0, Ordering::Relaxed);
+        self.transcription_degraded_events.store(0, Ordering::Relaxed);
+        if let Ok(mut degraded) = self.degraded.lock() {
+            *degraded = DegradedState::default();
+        }
         self.last_report_ms.store(0, Ordering::Relaxed);
     }
 
@@ -202,6 +228,23 @@ impl AudioPipelineMetrics {
         self.has_latest_audio_timestamp.store(1, Ordering::Relaxed);
     }
 
+    pub fn record_transcription_degraded(&self, start_s: f64, end_s: f64) {
+        if !self.enabled {
+            return;
+        }
+        self.transcription_degraded_events.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut degraded) = self.degraded.lock() {
+            if degraded.ranges.len() == MAX_RECOVERABLE_RANGES {
+                degraded.ranges.pop_front();
+                degraded.dropped_ranges = degraded.dropped_ranges.saturating_add(1);
+            }
+            degraded.ranges.push_back(AudioRange {
+                start_s: start_s.max(0.0),
+                end_s: end_s.max(start_s),
+            });
+        }
+    }
+
     pub fn maybe_log_summary(&self, force: bool) {
         if !self.enabled {
             return;
@@ -225,7 +268,7 @@ impl AudioPipelineMetrics {
 
         let snapshot = self.snapshot();
         info!(
-            "audio_pipeline_metrics session_ms={} input_depth={}/{} input_wait_ms={:?} transcription_depth={}/{} recording_depth={}/{} processed={} avg_process_ms={:.2} max_process_ms={:.2} rss_bytes={:?} rss_peak_bytes={:?} latest_audio_ts_s={:?}",
+            "audio_pipeline_metrics session_ms={} input_depth={}/{} input_wait_ms={:?} transcription_depth={}/{} recording_depth={}/{} processed={} avg_process_ms={:.2} max_process_ms={:.2} rss_bytes={:?} rss_peak_bytes={:?} latest_audio_ts_s={:?} transcription_degraded_events={}",
             snapshot.session_elapsed_ms,
             snapshot.input.depth,
             snapshot.input.peak_depth,
@@ -240,6 +283,7 @@ impl AudioPipelineMetrics {
             snapshot.rss_bytes,
             snapshot.rss_peak_bytes,
             snapshot.latest_audio_timestamp_s,
+            snapshot.transcription_degraded_events,
         );
     }
 
@@ -281,6 +325,11 @@ impl AudioPipelineMetrics {
         } else {
             None
         };
+        let (recoverable_ranges, recovery_ranges_dropped) = self
+            .degraded
+            .lock()
+            .map(|degraded| (degraded.ranges.iter().copied().collect(), degraded.dropped_ranges))
+            .unwrap_or_default();
 
         AudioPipelineMetricsSnapshot {
             session_elapsed_ms: self.session_elapsed().as_millis().min(u64::MAX as u128) as u64,
@@ -296,6 +345,9 @@ impl AudioPipelineMetrics {
             rss_bytes,
             rss_peak_bytes,
             latest_audio_timestamp_s,
+            transcription_degraded_events: self.transcription_degraded_events.load(Ordering::Relaxed),
+            recoverable_ranges,
+            recovery_ranges_dropped,
         }
     }
 
@@ -378,6 +430,20 @@ mod tests {
     }
 
     #[test]
+    fn records_bounded_recovery_ranges_for_transcription_overload() {
+        let metrics = AudioPipelineMetrics::new();
+        for index in 0..40 {
+            metrics.record_transcription_degraded(index as f64, index as f64 + 0.5);
+        }
+
+        let snapshot = metrics.snapshot();
+        assert_eq!(snapshot.transcription_degraded_events, 40);
+        assert_eq!(snapshot.recoverable_ranges.len(), 32);
+        assert_eq!(snapshot.recovery_ranges_dropped, 8);
+        assert_eq!(snapshot.recoverable_ranges.first().unwrap().start_s, 8.0);
+    }
+
+    #[test]
     fn start_session_resets_observation_window() {
         let metrics = AudioPipelineMetrics::new();
         metrics.enqueue(PipelineQueue::Recording);
@@ -388,5 +454,7 @@ mod tests {
         assert_eq!(snapshot.recording, QueueMetricsSnapshot::default());
         assert_eq!(snapshot.processed_chunks, 0);
         assert_eq!(snapshot.latest_audio_timestamp_s, None);
+        assert_eq!(snapshot.transcription_degraded_events, 0);
+        assert!(snapshot.recoverable_ranges.is_empty());
     }
 }
