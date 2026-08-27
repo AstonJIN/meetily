@@ -11,6 +11,7 @@ use rubato::{Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolat
 use super::devices::AudioDevice;
 use super::recording_state::{AudioChunk, AudioError, RecordingState, DeviceType};
 use super::pipeline_metrics::{AudioPipelineMetrics, PipelineQueue};
+use super::bounded_queue::{create_audio_input_queue, AudioQueueReceiver, AudioQueueSendError, AudioQueueSender, StreamingPipelineConfig};
 use super::audio_processing::{audio_to_mono, LoudnessNormalizer, NoiseSuppressionProcessor, HighPassFilter};
 use super::vad::{ContinuousVadProcessor};
 
@@ -679,7 +680,7 @@ impl AudioCapture {
 /// VAD-driven audio processing pipeline
 /// Uses Voice Activity Detection to segment speech in real-time and send only speech to Whisper
 pub struct AudioPipeline {
-    receiver: mpsc::UnboundedReceiver<AudioChunk>,
+    receiver: AudioQueueReceiver<AudioChunk>,
     transcription_sender: mpsc::UnboundedSender<AudioChunk>,
     state: Arc<RecordingState>,
     vad_processor: ContinuousVadProcessor,
@@ -700,7 +701,7 @@ pub struct AudioPipeline {
 
 impl AudioPipeline {
     pub fn new(
-        receiver: mpsc::UnboundedReceiver<AudioChunk>,
+        receiver: AudioQueueReceiver<AudioChunk>,
         transcription_sender: mpsc::UnboundedSender<AudioChunk>,
         state: Arc<RecordingState>,
         target_chunk_duration_ms: u32,
@@ -964,7 +965,8 @@ impl AudioPipeline {
 /// Simple audio pipeline manager
 pub struct AudioPipelineManager {
     pipeline_handle: Option<JoinHandle<Result<()>>>,
-    audio_sender: Option<mpsc::UnboundedSender<AudioChunk>>,
+    audio_sender: Option<AudioQueueSender<AudioChunk>>,
+    streaming_config: StreamingPipelineConfig,
 }
 
 impl AudioPipelineManager {
@@ -972,6 +974,7 @@ impl AudioPipelineManager {
         Self {
             pipeline_handle: None,
             audio_sender: None,
+            streaming_config: StreamingPipelineConfig::from_env(),
         }
     }
 
@@ -994,7 +997,13 @@ impl AudioPipelineManager {
         info!("   System Audio: '{}' ({:?})", system_device_name, system_device_kind);
 
         // Create audio processing channel
-        let (audio_sender, audio_receiver) = mpsc::unbounded_channel::<AudioChunk>();
+        let (audio_sender, audio_receiver) = create_audio_input_queue(self.streaming_config);
+
+        info!(
+            "Audio input queue: mode={}, capacity={}",
+            if audio_sender.is_bounded() { "bounded" } else { "unbounded" },
+            self.streaming_config.audio_input_capacity
+        );
 
         // Set sender in state for audio captures to use
         state.set_audio_sender(audio_sender.clone());
@@ -1062,8 +1071,11 @@ impl AudioPipelineManager {
                 device_type: super::recording_state::DeviceType::Microphone,
             };
 
-            if let Err(e) = sender.send(flush_chunk) {
-                warn!("Failed to send flush signal: {}", e);
+            if let Err(e) = sender.try_send(flush_chunk) {
+                match e {
+                    AudioQueueSendError::Full(_) => warn!("Audio input queue full while sending flush signal"),
+                    AudioQueueSendError::Closed(_) => warn!("Audio input queue closed while sending flush signal"),
+                }
             } else {
                 info!("📤 Sent flush signal to pipeline");
 
@@ -1081,7 +1093,7 @@ impl AudioPipelineManager {
                         chunk_id: u64::MAX - (i as u64),
                         device_type: super::recording_state::DeviceType::Microphone,
                     };
-                    let _ = sender.send(additional_flush);
+                    let _ = sender.try_send(additional_flush);
                 }
 
                 info!("📤 Sent additional flush signals for reliability");

@@ -1,0 +1,165 @@
+//! Queue adapters used by the streaming-pipeline pilot.
+//!
+//! The audio callback must never await. `AudioQueueSender::try_send` keeps
+//! that boundary explicit while allowing the existing unbounded path to stay
+//! available behind the rollback switch.
+
+use std::env;
+
+use tokio::sync::mpsc;
+
+pub const STREAMING_PIPELINE_ENV: &str = "MEETILY_STREAMING_PIPELINE_V1";
+pub const AUDIO_INPUT_QUEUE_CAPACITY_ENV: &str = "MEETILY_AUDIO_INPUT_QUEUE_CAPACITY";
+pub const DEFAULT_AUDIO_INPUT_QUEUE_CAPACITY: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamingPipelineConfig {
+    pub enabled: bool,
+    pub audio_input_capacity: usize,
+}
+
+impl Default for StreamingPipelineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            audio_input_capacity: DEFAULT_AUDIO_INPUT_QUEUE_CAPACITY,
+        }
+    }
+}
+
+impl StreamingPipelineConfig {
+    pub fn from_env() -> Self {
+        let enabled = env::var(STREAMING_PIPELINE_ENV)
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"))
+            .unwrap_or(false);
+        let audio_input_capacity = env::var(AUDIO_INPUT_QUEUE_CAPACITY_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|capacity| *capacity > 0)
+            .unwrap_or(DEFAULT_AUDIO_INPUT_QUEUE_CAPACITY);
+
+        Self {
+            enabled,
+            audio_input_capacity,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum AudioQueueSendError<T> {
+    Full(T),
+    Closed(T),
+}
+
+#[derive(Debug)]
+pub enum AudioQueueSender<T> {
+    Unbounded(mpsc::UnboundedSender<T>),
+    Bounded(mpsc::Sender<T>),
+}
+
+impl<T> Clone for AudioQueueSender<T> {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Unbounded(sender) => Self::Unbounded(sender.clone()),
+            Self::Bounded(sender) => Self::Bounded(sender.clone()),
+        }
+    }
+}
+
+impl<T> AudioQueueSender<T> {
+    pub fn try_send(&self, item: T) -> Result<(), AudioQueueSendError<T>> {
+        match self {
+            Self::Unbounded(sender) => sender
+                .send(item)
+                .map_err(|error| AudioQueueSendError::Closed(error.0)),
+            Self::Bounded(sender) => sender.try_send(item).map_err(|error| match error {
+                mpsc::error::TrySendError::Full(item) => AudioQueueSendError::Full(item),
+                mpsc::error::TrySendError::Closed(item) => AudioQueueSendError::Closed(item),
+            }),
+        }
+    }
+
+    pub fn is_bounded(&self) -> bool {
+        matches!(self, Self::Bounded(_))
+    }
+}
+
+#[derive(Debug)]
+pub enum AudioQueueReceiver<T> {
+    Unbounded(mpsc::UnboundedReceiver<T>),
+    Bounded(mpsc::Receiver<T>),
+}
+
+impl<T> AudioQueueReceiver<T> {
+    pub async fn recv(&mut self) -> Option<T> {
+        match self {
+            Self::Unbounded(receiver) => receiver.recv().await,
+            Self::Bounded(receiver) => receiver.recv().await,
+        }
+    }
+}
+
+pub fn unbounded<T>() -> (AudioQueueSender<T>, AudioQueueReceiver<T>) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    (
+        AudioQueueSender::Unbounded(sender),
+        AudioQueueReceiver::Unbounded(receiver),
+    )
+}
+
+pub fn bounded<T>(capacity: usize) -> (AudioQueueSender<T>, AudioQueueReceiver<T>) {
+    assert!(capacity > 0, "audio queue capacity must be greater than zero");
+    let (sender, receiver) = mpsc::channel(capacity);
+    (
+        AudioQueueSender::Bounded(sender),
+        AudioQueueReceiver::Bounded(receiver),
+    )
+}
+
+pub fn create_audio_input_queue(
+    config: StreamingPipelineConfig,
+) -> (AudioQueueSender<crate::audio::AudioChunk>, AudioQueueReceiver<crate::audio::AudioChunk>) {
+    if config.enabled {
+        bounded(config.audio_input_capacity)
+    } else {
+        unbounded()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_queue_rejects_full_without_waiting() {
+        let (sender, mut receiver) = bounded::<u8>(1);
+        assert!(sender.try_send(1).is_ok());
+        assert_eq!(sender.try_send(2), Err(AudioQueueSendError::Full(2)));
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime should be available");
+        assert_eq!(runtime.block_on(receiver.recv()), Some(1));
+    }
+
+    #[test]
+    fn closed_queue_returns_the_item_to_the_caller() {
+        let (sender, receiver) = bounded::<u8>(1);
+        drop(receiver);
+        assert_eq!(sender.try_send(7), Err(AudioQueueSendError::Closed(7)));
+    }
+
+    #[test]
+    fn disabled_config_keeps_the_legacy_unbounded_adapter() {
+        let (sender, _receiver) = create_audio_input_queue(StreamingPipelineConfig::default());
+        assert!(!sender.is_bounded());
+    }
+
+    #[test]
+    fn enabled_config_selects_the_configured_capacity() {
+        let config = StreamingPipelineConfig {
+            enabled: true,
+            audio_input_capacity: 3,
+        };
+        let (sender, _receiver) = create_audio_input_queue(config);
+        assert!(sender.is_bounded());
+    }
+}

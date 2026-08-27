@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tokio::sync::mpsc;
 use anyhow::Result;
 
 use super::devices::AudioDevice;
 use super::buffer_pool::AudioBufferPool;
 use super::pipeline_metrics::{AudioPipelineMetrics, PipelineQueue};
+use super::bounded_queue::{AudioQueueSendError, AudioQueueSender};
 
 /// Device type for audio chunks
 #[derive(Debug, Clone, PartialEq)]
@@ -106,7 +106,7 @@ pub struct RecordingState {
     disconnected_device: Mutex<Option<(Arc<AudioDevice>, DeviceType)>>,
 
     // Audio pipeline
-    audio_sender: Mutex<Option<mpsc::UnboundedSender<AudioChunk>>>,
+    audio_sender: Mutex<Option<AudioQueueSender<AudioChunk>>>,
     pipeline_metrics: Arc<AudioPipelineMetrics>,
 
     // Memory optimization
@@ -262,7 +262,7 @@ impl RecordingState {
     }
 
     // Audio pipeline management
-    pub fn set_audio_sender(&self, sender: mpsc::UnboundedSender<AudioChunk>) {
+    pub fn set_audio_sender(&self, sender: AudioQueueSender<AudioChunk>) {
         *self.audio_sender.lock().unwrap() = Some(sender);
     }
 
@@ -273,11 +273,17 @@ impl RecordingState {
         }
 
         if let Some(sender) = self.audio_sender.lock().unwrap().as_ref() {
-            sender.send(chunk).map_err(|_| {
-                self.pipeline_metrics.send_failure(PipelineQueue::AudioInput);
-                anyhow::anyhow!("Failed to send audio chunk")
-            })?;
-            self.pipeline_metrics.enqueue(PipelineQueue::AudioInput);
+            match sender.try_send(chunk) {
+                Ok(()) => self.pipeline_metrics.enqueue(PipelineQueue::AudioInput),
+                Err(AudioQueueSendError::Full(_)) => {
+                    self.pipeline_metrics.send_failure(PipelineQueue::AudioInput);
+                    return Err(anyhow::anyhow!("Audio input queue full"));
+                }
+                Err(AudioQueueSendError::Closed(_)) => {
+                    self.pipeline_metrics.send_failure(PipelineQueue::AudioInput);
+                    return Err(anyhow::anyhow!("Audio input queue closed"));
+                }
+            }
 
             // Update statistics
             let mut stats = self.stats.lock().unwrap();
