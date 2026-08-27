@@ -10,12 +10,16 @@ use tokio::sync::mpsc;
 
 pub const STREAMING_PIPELINE_ENV: &str = "MEETILY_STREAMING_PIPELINE_V1";
 pub const AUDIO_INPUT_QUEUE_CAPACITY_ENV: &str = "MEETILY_AUDIO_INPUT_QUEUE_CAPACITY";
+pub const AUDIO_MIX_WINDOW_MS_ENV: &str = "MEETILY_AUDIO_MIX_WINDOW_MS";
 pub const DEFAULT_AUDIO_INPUT_QUEUE_CAPACITY: usize = 64;
+pub const DEFAULT_STREAMING_MIX_WINDOW_MS: u32 = 40;
+pub const LEGACY_MIX_WINDOW_MS: u32 = 600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamingPipelineConfig {
     pub enabled: bool,
     pub audio_input_capacity: usize,
+    pub mix_window_ms: u32,
 }
 
 impl Default for StreamingPipelineConfig {
@@ -23,6 +27,7 @@ impl Default for StreamingPipelineConfig {
         Self {
             enabled: false,
             audio_input_capacity: DEFAULT_AUDIO_INPUT_QUEUE_CAPACITY,
+            mix_window_ms: DEFAULT_STREAMING_MIX_WINDOW_MS,
         }
     }
 }
@@ -37,12 +42,29 @@ impl StreamingPipelineConfig {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|capacity| *capacity > 0)
             .unwrap_or(DEFAULT_AUDIO_INPUT_QUEUE_CAPACITY);
+        let mix_window_ms = parse_mix_window_ms(env::var(AUDIO_MIX_WINDOW_MS_ENV).ok().as_deref());
 
         Self {
             enabled,
             audio_input_capacity,
+            mix_window_ms,
         }
     }
+
+    pub fn effective_mix_window_ms(self) -> u32 {
+        if self.enabled {
+            self.mix_window_ms
+        } else {
+            LEGACY_MIX_WINDOW_MS
+        }
+    }
+}
+
+fn parse_mix_window_ms(value: Option<&str>) -> u32 {
+    value
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| matches!(value, 20 | 40 | 50))
+        .unwrap_or(DEFAULT_STREAMING_MIX_WINDOW_MS)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -158,8 +180,24 @@ mod tests {
         let config = StreamingPipelineConfig {
             enabled: true,
             audio_input_capacity: 3,
+            mix_window_ms: 40,
         };
         let (sender, _receiver) = create_audio_input_queue(config);
         assert!(sender.is_bounded());
+    }
+
+    #[test]
+    fn only_supported_streaming_mix_windows_are_accepted() {
+        assert_eq!(parse_mix_window_ms(Some("20")), 20);
+        assert_eq!(parse_mix_window_ms(Some("40")), 40);
+        assert_eq!(parse_mix_window_ms(Some("50")), 50);
+        assert_eq!(parse_mix_window_ms(Some("600")), DEFAULT_STREAMING_MIX_WINDOW_MS);
+        assert_eq!(parse_mix_window_ms(Some("invalid")), DEFAULT_STREAMING_MIX_WINDOW_MS);
+    }
+
+    #[test]
+    fn legacy_mix_window_is_used_when_streaming_is_disabled() {
+        let config = StreamingPipelineConfig::default();
+        assert_eq!(config.effective_mix_window_ms(), LEGACY_MIX_WINDOW_MS);
     }
 }

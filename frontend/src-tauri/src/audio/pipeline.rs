@@ -25,20 +25,18 @@ struct AudioMixerRingBuffer {
 }
 
 impl AudioMixerRingBuffer {
-    fn new(sample_rate: u32) -> Self {
-        // Use 50ms windows for mixing
-        let window_ms = 600.0;
-        let window_size_samples = (sample_rate as f32 * window_ms / 1000.0) as usize;
+    fn new(sample_rate: u32, window_ms: u32) -> Self {
+        let window_size_samples = (sample_rate as usize * window_ms as usize) / 1000;
 
-        // CRITICAL FIX: Increase max buffer to 400ms for system audio stability
+        // Keep a bounded jitter allowance while deriving it from the selected window.
         // System audio (especially Core Audio on macOS) can have significant jitter
         // due to sample-by-sample streaming → batching → channel transmission
         // Accounts for: RNNoise buffering + Core Audio jitter + processing delays
-        let max_buffer_size = window_size_samples * 8;  // 400ms (was 200ms)
+        let max_buffer_size = window_size_samples * 8;
 
         info!("🔊 Ring buffer initialized: window={}ms ({} samples), max={}ms ({} samples)",
               window_ms, window_size_samples,
-              window_ms * 8.0, max_buffer_size);
+              window_ms as f64 * 8.0, max_buffer_size);
 
         Self {
             mic_buffer: VecDeque::with_capacity(max_buffer_size),
@@ -708,6 +706,7 @@ impl AudioPipeline {
         state: Arc<RecordingState>,
         target_chunk_duration_ms: u32,
         sample_rate: u32,
+        mix_window_ms: u32,
         mic_device_name: String,
         mic_device_kind: super::device_detection::InputDeviceKind,
         system_device_name: String,
@@ -743,7 +742,7 @@ impl AudioPipeline {
         };
 
         // Initialize professional audio mixing components
-        let ring_buffer = AudioMixerRingBuffer::new(sample_rate);
+        let ring_buffer = AudioMixerRingBuffer::new(sample_rate, mix_window_ms);
         let mixer = ProfessionalAudioMixer::new(sample_rate);
 
         // Note: target_chunk_duration_ms is ignored - VAD controls segmentation now
@@ -1018,6 +1017,7 @@ impl AudioPipelineManager {
             state.clone(),
             target_chunk_duration_ms,
             sample_rate,
+            self.streaming_config.effective_mix_window_ms(),
             mic_device_name,
             mic_device_kind,
             system_device_name,
@@ -1112,5 +1112,31 @@ impl AudioPipelineManager {
 impl Default for AudioPipelineManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_buffer_derives_sample_window_and_jitter_capacity() {
+        let ring_buffer = AudioMixerRingBuffer::new(48_000, 40);
+
+        assert_eq!(ring_buffer.window_size_samples, 1_920);
+        assert_eq!(ring_buffer.max_buffer_size, 15_360);
+        assert!(ring_buffer.mic_buffer.capacity() >= ring_buffer.max_buffer_size);
+        assert!(ring_buffer.system_buffer.capacity() >= ring_buffer.max_buffer_size);
+    }
+
+    #[test]
+    fn ring_buffer_can_mix_after_one_configured_window() {
+        let mut ring_buffer = AudioMixerRingBuffer::new(48_000, 20);
+        ring_buffer.add_samples(DeviceType::Microphone, vec![0.0; 960]);
+
+        assert!(ring_buffer.can_mix());
+        let (mic, system) = ring_buffer.extract_window().expect("window should be available");
+        assert_eq!(mic.len(), 960);
+        assert_eq!(system.len(), 960);
     }
 }
